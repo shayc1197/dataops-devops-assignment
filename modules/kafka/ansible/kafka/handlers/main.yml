@@ -1,0 +1,18 @@
+---
+- name: reload systemd
+  become: true
+  systemd:
+    daemon_reload: yes
+
+- name: restart confluent services
+  become: true
+  systemd:
+    name: "{{ item }}"
+    state: restarted
+  loop:
+    - confluent-zookeeper
+    - confluent-kafka
+    - confluent-schema-registry
+    - confluent-kafka-connect
+    - confluent-control-center
+  listen: restart confluent services

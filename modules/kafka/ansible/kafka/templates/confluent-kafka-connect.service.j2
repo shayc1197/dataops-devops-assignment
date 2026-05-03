@@ -1,0 +1,17 @@
+[Unit]
+Description=Confluent Kafka Connect
+After=network.target confluent-kafka.service
+Wants=confluent-kafka.service
+
+[Service]
+Type=simple
+User=confluent
+WorkingDirectory=/opt/confluent
+Environment="CONNECT_HEAP_OPTS=-Xms512M -Xmx1024M"
+ExecStart=/opt/confluent/bin/connect-distributed /opt/confluent/etc/kafka/connect-distributed.properties
+ExecStop=/bin/true
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
