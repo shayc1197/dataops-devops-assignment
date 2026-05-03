@@ -1,0 +1,35 @@
+# Terraform state files
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Terraform locks
+.terraform.lock.hcl
+
+# Terraform directories
+.terraform/
+
+# Terraform plans
+*.tfplan
+tfplan
+
+# Environment variables (sensitive data)
+terraform.tfvars
+**/*.tfvars
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Crash logs
+crash.log
+crash.*.log
+
+# Ignore all example files
+*.example
