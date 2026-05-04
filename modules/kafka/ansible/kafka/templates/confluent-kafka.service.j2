@@ -1,0 +1,17 @@
+[Unit]
+Description=Apache Kafka Broker
+After=network.target confluent-zookeeper.service
+Wants=confluent-zookeeper.service
+
+[Service]
+Type=simple
+User=confluent
+WorkingDirectory=/opt/confluent
+Environment="KAFKA_HEAP_OPTS=-Xms512M -Xmx1024M"
+ExecStart=/opt/confluent/bin/kafka-server-start /opt/confluent/etc/kafka/server.properties
+ExecStop=/opt/confluent/bin/kafka-server-stop
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,17 @@
+[Unit]
+Description=Confluent Schema Registry
+After=network.target confluent-kafka.service
+Wants=confluent-kafka.service
+
+[Service]
+Type=simple
+User=confluent
+WorkingDirectory=/opt/confluent
+Environment="SCHEMA_REGISTRY_HEAP_OPTS=-Xms256M -Xmx512M"
+ExecStart=/opt/confluent/bin/schema-registry-start /opt/confluent/etc/schema-registry/schema-registry.properties
+ExecStop=/opt/confluent/bin/schema-registry-stop
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

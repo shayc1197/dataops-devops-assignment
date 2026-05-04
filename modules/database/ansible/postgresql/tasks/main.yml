@@ -1,0 +1,293 @@
+---
+# Install PostgreSQL and system configuration
+- name: PostgreSQL installation and configuration block
+  become: true
+  block:
+    - name: Wait for apt and dpkg locks to be released
+      shell: |
+        while fuser /var/lib/dpkg/lock-frontend \
+                    /var/lib/dpkg/lock \
+                    /var/cache/apt/archives/lock \
+                    /var/lib/apt/lists/lock >/dev/null 2>&1; do
+          sleep 5
+        done
+
+    - name: Install dependencies for PostgreSQL repository
+      apt:
+        name: [gnupg2, wget, ca-certificates, acl]
+        state: present
+        lock_timeout: 300
+
+    - name: Add PostgreSQL official GPG key
+      apt_key:
+        url: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+        state: present
+
+    - name: Add PostgreSQL official repository
+      apt_repository:
+        repo: "deb http://apt.postgresql.org/pub/repos/apt/ {{ ansible_distribution_release }}-pgdg main"
+        state: present
+
+    - name: Install PostgreSQL 15
+      apt:
+        name:
+          - postgresql-15
+          - postgresql-contrib-15
+        state: present
+        update_cache: yes
+        lock_timeout: 300
+
+    - name: Ensure PostgreSQL is started and enabled
+      systemd:
+        name: postgresql
+        enabled: yes
+        state: started
+
+    # =============================
+    # NETWORK (FIX)
+    # =============================
+
+    - name: Allow external connections
+      lineinfile:
+        path: /etc/postgresql/15/main/postgresql.conf
+        regexp: '^listen_addresses'
+        line: "listen_addresses = '*'"
+      notify: restart postgresql
+
+    # =============================
+    # TLS CONFIG (FULL)
+    # =============================
+
+    - name: Create SSL directory
+      file:
+        path: /etc/postgresql/15/main/ssl
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: '0700'
+
+    - name: Generate Root CA key
+      command: openssl genrsa -out /etc/postgresql/15/main/ssl/rootCA.key 2048
+      args:
+        creates: /etc/postgresql/15/main/ssl/rootCA.key
+
+    - name: Generate Root CA certificate
+      command: >
+        openssl req -x509 -new -nodes
+        -key /etc/postgresql/15/main/ssl/rootCA.key
+        -sha256 -days 365
+        -out /etc/postgresql/15/main/ssl/rootCA.pem
+        -subj "/CN=postgres-ca"
+      args:
+        creates: /etc/postgresql/15/main/ssl/rootCA.pem
+
+    - name: Generate server key
+      command: openssl genrsa -out /etc/postgresql/15/main/ssl/server.key 2048
+      args:
+        creates: /etc/postgresql/15/main/ssl/server.key
+
+    - name: Generate server CSR
+      command: >
+        openssl req -new
+        -key /etc/postgresql/15/main/ssl/server.key
+        -out /etc/postgresql/15/main/ssl/server.csr
+        -subj "/CN={{ ansible_hostname }}"
+      args:
+        creates: /etc/postgresql/15/main/ssl/server.csr
+
+    - name: Sign server certificate
+      command: >
+        openssl x509 -req
+        -in /etc/postgresql/15/main/ssl/server.csr
+        -CA /etc/postgresql/15/main/ssl/rootCA.pem
+        -CAkey /etc/postgresql/15/main/ssl/rootCA.key
+        -CAcreateserial
+        -out /etc/postgresql/15/main/ssl/server.crt
+        -days 365 -sha256
+      args:
+        creates: /etc/postgresql/15/main/ssl/server.crt
+
+    - name: Set permissions
+      file:
+        path: "/etc/postgresql/15/main/ssl/{{ item.name }}"
+        owner: postgres
+        group: postgres
+        mode: "{{ item.mode }}"
+      loop:
+        - { name: "server.key", mode: "0600" }
+        - { name: "server.crt", mode: "0644" }
+        - { name: "rootCA.pem", mode: "0644" }
+
+    - name: Enable SSL
+      lineinfile:
+        path: /etc/postgresql/15/main/postgresql.conf
+        regexp: '^ssl\s*='
+        line: 'ssl = on'
+      notify: restart postgresql
+
+    - name: Set SSL cert path
+      lineinfile:
+        path: /etc/postgresql/15/main/postgresql.conf
+        regexp: '^ssl_cert_file'
+        line: "ssl_cert_file = '/etc/postgresql/15/main/ssl/server.crt'"
+      notify: restart postgresql
+
+    - name: Set SSL key path
+      lineinfile:
+        path: /etc/postgresql/15/main/postgresql.conf
+        regexp: '^ssl_key_file'
+        line: "ssl_key_file = '/etc/postgresql/15/main/ssl/server.key'"
+      notify: restart postgresql
+
+    - name: Set SSL CA file
+      lineinfile:
+        path: /etc/postgresql/15/main/postgresql.conf
+        regexp: '^ssl_ca_file'
+        line: "ssl_ca_file = '/etc/postgresql/15/main/ssl/rootCA.pem'"
+      notify: restart postgresql
+
+    # =============================
+    # CDC CONFIG (UNCHANGED)
+    # =============================
+
+    - name: Set wal_level to logical
+      lineinfile:
+        path: /etc/postgresql/15/main/postgresql.conf
+        regexp: '^wal_level'
+        line: 'wal_level = logical'
+      notify: restart postgresql
+
+    - name: Set max_wal_senders
+      lineinfile:
+        path: /etc/postgresql/15/main/postgresql.conf
+        regexp: '^max_wal_senders'
+        line: 'max_wal_senders = 10'
+      notify: restart postgresql
+
+    # =============================
+    # SECURITY (FIXED)
+    # =============================
+
+    - name: Enforce SSL-only connections with cert auth
+      copy:
+        dest: /etc/postgresql/15/main/pg_hba.conf
+        content: |
+          local   all             postgres                                peer
+          local   all             all                                     peer
+          hostssl all             all             10.0.0.0/16            cert clientcert=verify-full
+          hostssl replication     all             10.0.0.0/16            cert clientcert=verify-full
+        owner: postgres
+        group: postgres
+        mode: '0644'
+      notify: restart postgresql
+
+    - name: Generate client key for postgres user
+      command: openssl genrsa -out /etc/postgresql/15/main/ssl/client.key 2048
+      args:
+        creates: /etc/postgresql/15/main/ssl/client.key
+
+    - name: Generate client CSR (CN must match PostgreSQL username)
+      command: >
+        openssl req -new
+        -key /etc/postgresql/15/main/ssl/client.key
+        -out /etc/postgresql/15/main/ssl/client.csr
+        -subj "/CN=postgres"
+      args:
+        creates: /etc/postgresql/15/main/ssl/client.csr
+
+    - name: Sign client certificate with rootCA
+      command: >
+        openssl x509 -req
+        -in /etc/postgresql/15/main/ssl/client.csr
+        -CA /etc/postgresql/15/main/ssl/rootCA.pem
+        -CAkey /etc/postgresql/15/main/ssl/rootCA.key
+        -CAcreateserial
+        -out /etc/postgresql/15/main/ssl/client.crt
+        -days 365 -sha256
+      args:
+        creates: /etc/postgresql/15/main/ssl/client.crt
+
+    - name: Set client cert/key permissions
+      file:
+        path: "/etc/postgresql/15/main/ssl/{{ item.name }}"
+        owner: postgres
+        group: postgres
+        mode: "{{ item.mode }}"
+      loop:
+        - { name: "client.key", mode: "0600" }
+        - { name: "client.crt", mode: "0644" }
+
+    - name: Install python3-psycopg2 PostgreSQL modules
+      apt:
+        name: python3-psycopg2
+        state: present
+        update_cache: yes
+        lock_timeout: 300
+
+# Fetch certs (needs become to read postgres files)
+- name: Fetch root CA from PostgreSQL server into Kafka role files
+  fetch:
+    src: /etc/postgresql/15/main/ssl/rootCA.pem
+    dest: /home/shayc/terraform-aws-project/modules/kafka/ansible/kafka/files/rootCA.pem
+    flat: yes
+  become: true
+
+- name: Fetch client certificate into Kafka role files
+  fetch:
+    src: /etc/postgresql/15/main/ssl/client.crt
+    dest: /home/shayc/terraform-aws-project/modules/kafka/ansible/kafka/files/client.crt
+    flat: yes
+  become: true
+
+- name: Fetch client key into Kafka role files
+  fetch:
+    src: /etc/postgresql/15/main/ssl/client.key
+    dest: /home/shayc/terraform-aws-project/modules/kafka/ansible/kafka/files/client.key
+    flat: yes
+  become: true
+
+# =============================
+# DB SETUP (UNCHANGED)
+# =============================
+
+- name: Create ordersdb database
+  become: true
+  become_user: postgres
+  postgresql_db:
+    name: ordersdb
+    state: present
+
+- name: Create orders table
+  become: true
+  become_user: postgres
+  postgresql_query:
+    db: ordersdb
+    query: |
+      CREATE TABLE IF NOT EXISTS orders (
+        id SERIAL PRIMARY KEY,
+        customer_name VARCHAR(255) NOT NULL,
+        amount NUMERIC(10,2) NOT NULL,
+        status VARCHAR(50) NOT NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT NOW()
+      );
+
+- name: Create replication slot for Debezium
+  become: true
+  become_user: postgres
+  postgresql_query:
+    db: ordersdb
+    query: "SELECT * FROM pg_create_logical_replication_slot('debezium_slot', 'pgoutput');"
+  ignore_errors: true
+
+# =============================
+# VERIFY SSL (BONUS)
+# =============================
+
+- name: Verify SSL connection
+  become: true
+  become_user: postgres
+  shell: psql -d ordersdb -c "\conninfo"
+  register: ssl_check
+
+- debug:
+    var: ssl_check.stdout

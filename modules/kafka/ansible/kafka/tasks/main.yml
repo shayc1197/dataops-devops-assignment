@@ -1,0 +1,501 @@
+---
+- name: Wait for system to be ready
+  wait_for_connection:
+    delay: 10
+    timeout: 300
+
+- name: Kafka installation and configuration block
+  become: true
+  block:
+    - name: Wait for apt and dpkg locks to be released
+      shell: |
+        while fuser /var/lib/dpkg/lock-frontend \
+                    /var/lib/dpkg/lock \
+                    /var/cache/apt/archives/lock \
+                    /var/lib/apt/lists/lock >/dev/null 2>&1; do
+          sleep 5
+        done
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+        lock_timeout: 300
+
+    - name: Install Kafka host prerequisites
+      apt:
+        name:
+          - acl
+          - openjdk-17-jdk
+          - unzip
+          - jq
+        state: present
+        lock_timeout: 300
+
+    - name: Create confluent group
+      group:
+        name: "{{ confluent_group }}"
+        state: present
+
+    - name: Create confluent user
+      user:
+        name: "{{ confluent_user }}"
+        group: "{{ confluent_group }}"
+        home: "{{ confluent_home }}"
+        shell: /bin/bash
+        createhome: yes
+        state: present
+
+    - name: Create Confluent directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ confluent_user }}"
+        group: "{{ confluent_group }}"
+        mode: "0755"
+      loop:
+        - "{{ confluent_home }}"
+        - "{{ confluent_home }}/data"
+        - "{{ confluent_home }}/logs"
+
+    - name: Download Confluent Platform
+      get_url:
+        url: "https://packages.confluent.io/archive/{{ confluent_version.split('.')[0] }}.{{ confluent_version.split('.')[1] }}/confluent-{{ confluent_version }}.tar.gz"
+        dest: "/tmp/confluent-{{ confluent_version }}.tar.gz"
+        timeout: 600
+      register: confluent_download
+      retries: 3
+      delay: 10
+
+    - name: Extract Confluent Platform
+      unarchive:
+        src: "/tmp/confluent-{{ confluent_version }}.tar.gz"
+        dest: "{{ confluent_home }}"
+        owner: "{{ confluent_user }}"
+        group: "{{ confluent_group }}"
+        remote_src: yes
+        extra_opts: ["--strip-components=1"]
+
+    - name: Install Confluent systemd services
+      template:
+        src: "{{ item }}.j2"
+        dest: "/etc/systemd/system/{{ item }}"
+        mode: "0644"
+      loop:
+        - confluent-zookeeper.service
+        - confluent-kafka.service
+        - confluent-schema-registry.service
+        - confluent-kafka-connect.service
+        - confluent-control-center.service
+      notify: reload systemd
+
+    - name: Create Confluent configuration
+      template:
+        src: "{{ item }}.j2"
+        dest: "{{ confluent_home }}/etc/kafka/{{ item }}"
+        owner: "{{ confluent_user }}"
+        group: "{{ confluent_group }}"
+      loop:
+        - server.properties
+        - connect-distributed.properties
+      notify: restart confluent services
+
+    - name: Create swapfile for Confluent services
+      shell: |
+        if [ ! -f /swapfile ]; then
+          fallocate -l 4G /swapfile
+          chmod 600 /swapfile
+          mkswap /swapfile
+          swapon /swapfile
+          echo '/swapfile none swap sw 0 0' >> /etc/fstab
+        fi
+      become: true
+      args:
+        creates: /swapfile
+
+    - name: Enable and start Confluent services
+      become: true
+      systemd:
+        name: "{{ item }}"
+        enabled: yes
+        state: started
+        daemon_reload: yes
+      loop:
+        - confluent-zookeeper
+        - confluent-kafka
+        - confluent-schema-registry
+        - confluent-kafka-connect
+        # confluent-control-center requires ~4GB RAM; skipped in dev (3.7GB instance)
+
+- name: Create Control Center config directory
+  become: true
+  file:
+    path: "{{ confluent_home }}/etc/confluent-control-center"
+    state: directory
+    owner: "{{ confluent_user }}"
+    group: "{{ confluent_group }}"
+    mode: "0755"
+
+- name: Create Control Center properties
+  become: true
+  copy:
+    dest: "{{ confluent_home }}/etc/confluent-control-center/control-center.properties"
+    owner: "{{ confluent_user }}"
+    group: "{{ confluent_group }}"
+    mode: "0644"
+    content: |
+      bootstrap.servers=localhost:9092
+      zookeeper.connect=localhost:2181
+      confluent.controlcenter.mode.enable=management
+      confluent.controlcenter.prometheus.enable=false
+      confluent.controlcenter.internal.topics.replication=1
+      confluent.controlcenter.command.topic.replication=1
+      confluent.controlcenter.monitoring.interceptor.topic.replication=1
+      confluent.controlcenter.monitoring.topic.replication=1
+      confluent.controlcenter.monitoring.topic.partitions=1
+      confluent.metrics.topic.replication=1
+      confluent.controlcenter.internal.topics.partitions=1
+      confluent.controlcenter.command.topic.partitions=1
+      confluent.controlcenter.monitoring.interceptor.topic.partitions=1
+      confluent.controlcenter.streams.num.stream.threads=1
+      confluent.controlcenter.rest.listeners=http://0.0.0.0:9021
+      confluent.controlcenter.data.dir={{ confluent_home }}/data/control-center
+      confluent.controlcenter.connect.connect-default.cluster=http://localhost:8083
+      confluent.controlcenter.schema.registry.url=http://localhost:8081
+  register: cc_config_update
+
+- name: Stop Control Center if config changed
+  become: true
+  systemd:
+    name: confluent-control-center
+    state: stopped
+  when: cc_config_update.changed
+  ignore_errors: yes
+
+- name: Wait for Kafka broker to be ready
+  wait_for:
+    host: localhost
+    port: 9092
+    delay: 5
+    timeout: 300
+
+- name: Create cdc.orders topic
+  shell: |
+    {{ confluent_home }}/bin/kafka-topics \
+      --create \
+      --topic {{ kafka_topic_name }} \
+      --partitions {{ kafka_topic_partitions }} \
+      --replication-factor {{ kafka_topic_replication_factor }} \
+      --bootstrap-server localhost:9092 \
+      --if-not-exists
+  environment:
+    KAFKA_HEAP_OPTS: "-Xms512M -Xmx512M"
+  become_user: "{{ confluent_user }}"
+  retries: 3
+  delay: 5
+  register: topic_creation
+  failed_when:
+    - topic_creation.rc != 0
+    - "'already exists' not in topic_creation.stderr"
+
+- name: Wait for Kafka Connect to be ready
+  wait_for:
+    host: localhost
+    port: 8083
+    delay: 5
+    timeout: 300
+
+- name: Wait 10 seconds for services to stabilize
+  pause:
+    seconds: 10
+
+- name: Start Control Center (after other services are up)
+  become: true
+  systemd:
+    name: confluent-control-center
+    enabled: yes
+    state: restarted
+    daemon_reload: yes
+  register: cc_start
+
+- name: Give Control Center time to start listening
+  pause:
+    seconds: 5
+
+- name: Wait for Control Center to be ready
+  wait_for:
+    host: localhost
+    port: 9021
+    delay: 5
+    timeout: 60
+  ignore_errors: yes
+
+- name: Create Iceberg connector config directory
+  file:
+    path: "{{ kafka_connect_iceberg_config_dir }}"
+    state: directory
+    owner: "{{ confluent_user }}"
+    group: "{{ confluent_group }}"
+    mode: "0755"
+  become: true
+
+- name: Copy PostgreSQL root CA certificate to Kafka host
+  copy:
+    src: rootCA.pem
+    dest: "{{ kafka_connect_iceberg_config_dir }}/rootCA.pem"
+    owner: "{{ confluent_user }}"
+    group: "{{ confluent_group }}"
+    mode: "0644"
+  become: true
+
+- name: Copy PostgreSQL client certificate to Kafka host
+  copy:
+    src: client.crt
+    dest: "{{ kafka_connect_iceberg_config_dir }}/client.crt"
+    owner: "{{ confluent_user }}"
+    group: "{{ confluent_group }}"
+    mode: "0644"
+  become: true
+
+- name: Copy PostgreSQL client key to Kafka host
+  copy:
+    src: client.key
+    dest: "{{ kafka_connect_iceberg_config_dir }}/client.key"
+    owner: "{{ confluent_user }}"
+    group: "{{ confluent_group }}"
+    mode: "0600"
+  become: true
+
+- name: Convert client key to PKCS8 DER format (required by Debezium JDBC driver)
+  command: >
+    openssl pkcs8 -topk8 -nocrypt
+    -in {{ kafka_connect_iceberg_config_dir }}/client.key
+    -outform DER
+    -out {{ kafka_connect_iceberg_config_dir }}/client.pk8
+  become: true
+
+- name: Set client.pk8 permissions
+  file:
+    path: "{{ kafka_connect_iceberg_config_dir }}/client.pk8"
+    owner: "{{ confluent_user }}"
+    group: "{{ confluent_group }}"
+    mode: "0600"
+  become: true
+
+- name: Create Kafka Connect plugin directories
+  become: true
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ confluent_user }}"
+    group: "{{ confluent_group }}"
+    mode: "0755"
+  loop:
+    - "{{ kafka_connect_iceberg_plugin_dir }}"
+    - "{{ kafka_connect_debezium_plugin_dir }}"
+
+- name: Download Iceberg Kafka Connect Sink JAR
+  get_url:
+    url: "{{ iceberg_connector_jar_url }}"
+    dest: "/tmp/{{ iceberg_connector_jar_name }}"
+    timeout: 300
+  retries: 3
+  delay: 10
+  register: iceberg_download
+
+- name: Extract Iceberg connector ZIP
+  become: true
+  shell: |
+    rm -rf {{ kafka_connect_iceberg_plugin_dir }}
+    mkdir -p {{ kafka_connect_iceberg_plugin_dir }}
+    unzip -o /tmp/{{ iceberg_connector_jar_name }} -d {{ kafka_connect_iceberg_plugin_dir }}
+    chown -R {{ confluent_user }}:{{ confluent_group }} {{ kafka_connect_iceberg_plugin_dir }}
+
+- name: Download Debezium PostgreSQL Connector JAR
+  get_url:
+    url: "{{ debezium_connector_jar_url }}"
+    dest: "/tmp/{{ debezium_connector_jar_name }}"
+    timeout: 300
+  retries: 3
+  delay: 10
+  register: debezium_download
+
+- name: Extract Debezium connector JAR
+  become: true
+  shell: |
+    cd {{ kafka_connect_debezium_plugin_dir }}
+    unzip -o /tmp/{{ debezium_connector_jar_name }}
+    chown -R {{ confluent_user }}:{{ confluent_group }} {{ kafka_connect_debezium_plugin_dir }}
+  environment:
+    PATH: "/usr/bin:/bin"
+
+- name: Restart Kafka Connect to reload plugins
+  become: true
+  systemd:
+    name: confluent-kafka-connect
+    state: restarted
+    daemon_reload: yes
+  register: kc_restart
+
+- name: Wait for Kafka Connect to be ready after restart
+  wait_for:
+    host: localhost
+    port: 8083
+    delay: 5
+    timeout: 60
+
+- name: Wait 5 seconds for plugin loading
+  pause:
+    seconds: 5
+
+- name: Create Iceberg sink connector configuration
+  become: true
+  copy:
+    content: |
+      {
+        "name": "{{ iceberg_connector_name }}",
+        "config": {
+          "connector.class": "io.tabular.iceberg.connect.IcebergSinkConnector",
+          "tasks.max": "1",
+          "topics": "{{ kafka_topic_name }}",
+          "iceberg.tables": "{{ iceberg_table_namespace }}.{{ iceberg_table_name }}",
+          "iceberg.tables.auto-create-enabled": "false",
+          "iceberg.tables.commitIntervalMs": "15000",
+          "iceberg.kafka.session.timeout.ms": "60000",
+          "iceberg.kafka.heartbeat.interval.ms": "20000",
+          "iceberg.kafka.max.poll.interval.ms": "300000",
+          "table.write.format": "parquet",
+          "table.write.upsert.mode": "none",
+          "iceberg.catalog.type": "rest",
+          "iceberg.catalog.uri": "{{ s3tables_rest_endpoint }}",
+          "iceberg.catalog.warehouse": "{{ s3tables_table_bucket_arn }}",
+          "iceberg.catalog.rest.sigv4-enabled": "true",
+          "iceberg.catalog.rest.signing-name": "s3tables",
+          "iceberg.catalog.rest.signing-region": "{{ aws_region }}",
+          "iceberg.catalog.io-impl": "org.apache.iceberg.aws.s3.S3FileIO",
+          "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+          "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+          "key.converter.schemas.enable": "false",
+          "value.converter.schemas.enable": "false",
+          "transforms": "debezium,rename",
+          "transforms.debezium.type": "io.tabular.iceberg.connect.transforms.DebeziumTransform",
+          "transforms.rename.type": "org.apache.kafka.connect.transforms.ReplaceField$Value",
+          "transforms.rename.renames": "_cdc.op:__op,_cdc.ts:__source_ts"
+        }
+      }
+    dest: "{{ kafka_connect_iceberg_config_dir }}/iceberg-sink.json"
+    owner: "{{ confluent_user }}"
+    group: "{{ confluent_group }}"
+    mode: "0644"
+
+- name: Deploy Iceberg connector via Kafka Connect REST API
+  uri:
+    url: "http://localhost:8083/connectors"
+    method: POST
+    body_format: json
+    headers:
+      Content-Type: "application/json"
+    body:
+      name: "{{ iceberg_connector_name }}"
+      config:
+        connector.class: "io.tabular.iceberg.connect.IcebergSinkConnector"
+        tasks.max: "1"
+        topics: "{{ kafka_topic_name }}"
+        iceberg.tables: "{{ iceberg_table_namespace }}.{{ iceberg_table_name }}"
+        iceberg.tables.auto-create-enabled: "false"
+        iceberg.tables.commitIntervalMs: "15000"
+        iceberg.kafka.session.timeout.ms: "60000"
+        iceberg.kafka.heartbeat.interval.ms: "20000"
+        iceberg.kafka.max.poll.interval.ms: "300000"
+        table.write.format: "parquet"
+        table.write.upsert.mode: "none"
+        iceberg.catalog.type: "rest"
+        iceberg.catalog.uri: "{{ s3tables_rest_endpoint }}"
+        iceberg.catalog.warehouse: "{{ s3tables_table_bucket_arn }}"
+        iceberg.catalog.rest.sigv4-enabled: "true"
+        iceberg.catalog.rest.signing-name: "s3tables"
+        iceberg.catalog.rest.signing-region: "{{ aws_region }}"
+        iceberg.catalog.io-impl: "org.apache.iceberg.aws.s3.S3FileIO"
+        key.converter: "org.apache.kafka.connect.json.JsonConverter"
+        value.converter: "org.apache.kafka.connect.json.JsonConverter"
+        key.converter.schemas.enable: "false"
+        value.converter.schemas.enable: "false"
+        transforms: "debezium,rename"
+        transforms.debezium.type: "io.tabular.iceberg.connect.transforms.DebeziumTransform"
+        transforms.rename.type: "org.apache.kafka.connect.transforms.ReplaceField$Value"
+        transforms.rename.renames: "_cdc.op:__op,_cdc.ts:__source_ts"
+    status_code: [201, 409]
+  retries: 5
+  delay: 10
+  ignore_errors: yes
+
+- name: Create Debezium PostgreSQL connector configuration
+  become: true
+  copy:
+    content: |
+      {
+        "name": "{{ debezium_connector_name }}",
+        "config": {
+          "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+          "database.hostname": "{{ debezium_postgres_host }}",
+          "database.port": "{{ debezium_postgres_port }}",
+          "database.user": "{{ debezium_postgres_user }}",
+          "database.dbname": "{{ debezium_postgres_db }}",
+          "database.sslmode": "verify-ca",
+          "database.sslrootcert": "{{ kafka_connect_iceberg_config_dir }}/rootCA.pem",
+          "database.sslcert": "{{ kafka_connect_iceberg_config_dir }}/client.crt",
+          "database.sslkey": "{{ kafka_connect_iceberg_config_dir }}/client.pk8",
+          "topic.prefix": "postgres-orders",
+          "table.include.list": "public.orders",
+          "plugin.name": "pgoutput",
+          "decimal.handling.mode": "string",
+          "publication.name": "debezium",
+          "replication.slot.name": "{{ debezium_postgres_slot_name }}",
+          "slot.drop.on.stop": "false",
+          "transforms": "route",
+          "transforms.route.type": "org.apache.kafka.connect.transforms.RegexRouter",
+          "transforms.route.regex": "([^.]+)\\.([^.]+)\\.([^.]+)",
+          "transforms.route.replacement": "cdc.orders"
+        }
+      }
+    dest: "{{ kafka_connect_iceberg_config_dir }}/debezium-postgres.json"
+    owner: "{{ confluent_user }}"
+    group: "{{ confluent_group }}"
+    mode: "0644"
+  vars:
+    kafka_connect_iceberg_config_dir: "/opt/confluent/etc/kafka-connect-iceberg"
+
+- name: Deploy Debezium PostgreSQL connector via Kafka Connect REST API
+  uri:
+    url: "http://localhost:8083/connectors"
+    method: POST
+    body_format: json
+    headers:
+      Content-Type: "application/json"
+    body:
+      name: "{{ debezium_connector_name }}"
+      config:
+        connector.class: "io.debezium.connector.postgresql.PostgresConnector"
+        database.hostname: "{{ debezium_postgres_host }}"
+        database.port: "{{ debezium_postgres_port }}"
+        database.user: "{{ debezium_postgres_user }}"
+        database.dbname: "{{ debezium_postgres_db }}"
+        database.sslmode: "verify-ca"
+        database.sslrootcert: "{{ kafka_connect_iceberg_config_dir }}/rootCA.pem"
+        database.sslcert: "{{ kafka_connect_iceberg_config_dir }}/client.crt"
+        database.sslkey: "{{ kafka_connect_iceberg_config_dir }}/client.pk8"
+        topic.prefix: "postgres-orders"
+        table.include.list: "public.orders"
+        plugin.name: "pgoutput"
+        decimal.handling.mode: "string"
+        publication.name: "debezium"
+        replication.slot.name: "{{ debezium_postgres_slot_name }}"
+        slot.drop.on.stop: "false"
+        transforms: "route"
+        transforms.route.type: "org.apache.kafka.connect.transforms.RegexRouter"
+        transforms.route.regex: "([^.]+)\\.([^.]+)\\.([^.]+)"
+        transforms.route.replacement: "cdc.orders"
+    status_code: [201, 409]
+  retries: 5
+  delay: 10
+  ignore_errors: yes
